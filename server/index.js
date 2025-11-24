@@ -1,0 +1,78 @@
+const express=require('express')
+const helmet=require('helmet')
+const cors=require('cors')
+const cookieParser=require('cookie-parser')
+const argon2=require('argon2')
+const Database=require('better-sqlite3')
+const crypto=require('crypto')
+const {v4:uuidv4}=require('uuid')
+const jwt=require('jsonwebtoken')
+const fs=require('fs')
+const path=require('path')
+
+const PORT=parseInt(process.env.PORT||'8020',10)
+const AES_KEY_HEX=process.env.AES_KEY||crypto.randomBytes(32).toString('hex')
+const AES_KEY=Buffer.from(AES_KEY_HEX,'hex')
+const PEPPER=process.env.PEPPER||crypto.randomBytes(32).toString('hex')
+const JWT_SECRET=process.env.JWT_SECRET||crypto.randomBytes(32).toString('hex')
+
+const app=express()
+app.use(helmet())
+app.use(cors({origin:true,credentials:true}))
+app.use(express.json())
+app.use(cookieParser())
+
+const staticRoot=path.join(__dirname,'..','Shared (App)','Resources','admin')
+if(fs.existsSync(staticRoot)){
+  app.use(express.static(staticRoot))
+}
+
+const dataDir=path.join(__dirname,'data')
+if(!fs.existsSync(dataDir))fs.mkdirSync(dataDir,{recursive:true})
+const db=new Database(path.join(dataDir,'app.db'))
+
+db.exec('CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, username TEXT UNIQUE, display_name TEXT, role TEXT, parent_id TEXT, is_active INTEGER, password_hash TEXT, created_at INTEGER)')
+db.exec('CREATE TABLE IF NOT EXISTS channels (id TEXT PRIMARY KEY, name TEXT UNIQUE, created_by TEXT, is_active INTEGER, created_at INTEGER)')
+db.exec('CREATE TABLE IF NOT EXISTS customers (id TEXT PRIMARY KEY, phone_hash TEXT, phone_encrypted TEXT, channel_id TEXT, owner_operator_id TEXT, owner_admin_id TEXT, created_at INTEGER)')
+db.exec('CREATE TABLE IF NOT EXISTS duplicates (id TEXT PRIMARY KEY, customer_id TEXT, first_owner_id TEXT, duplicate_operator_id TEXT, duplicate_channel_id TEXT, duplicate_at INTEGER)')
+
+function normalizePhone(input){let s=String(input||'').trim().replace(/[\s+()\-－—]/g,'');let r='';for(let i=0;i<s.length;i++){const c=s[i];if(c>='0'&&c<='9')r+=c}if(r.length<4||r.length>11)throw new Error('invalid');return r}
+function hmac(text){return crypto.createHmac('sha256',Buffer.from(PEPPER,'hex')).update(text).digest('hex')}
+function encryptText(text){const iv=crypto.randomBytes(12);const cipher=crypto.createCipheriv('aes-256-gcm',AES_KEY,iv);const enc=Buffer.concat([cipher.update(text,'utf8'),cipher.final()]);const tag=cipher.getAuthTag();const combined=Buffer.concat([iv,tag,enc]);return combined.toString('base64')}
+
+function signToken(user){return jwt.sign({id:user.id,role:user.role},JWT_SECRET,{expiresIn:'2h'})}
+function auth(req,res,next){const t=req.cookies.token;if(!t)return res.status(401).json({error:'unauth'});try{const p=jwt.verify(t,JWT_SECRET);req.auth=p;next()}catch(e){return res.status(401).json({error:'unauth'})}}
+function requireRole(roles){return(req,res,next)=>{if(!req.auth||!roles.includes(req.auth.role))return res.status(403).json({error:'forbidden'});next()}}
+
+app.post('/api/login',async(req,res)=>{const {username,password}=req.body||{};if(!username||!password)return res.status(400).json({error:'invalid'});const user=db.prepare('SELECT * FROM users WHERE username=? AND is_active=1').get(username);if(!user)return res.status(400).json({error:'invalid'});const ok=await argon2.verify(user.password_hash,password);if(!ok)return res.status(400).json({error:'invalid'});const token=signToken(user);res.cookie('token',token,{httpOnly:true,sameSite:'lax'});res.json({ok:true,role:user.role,display_name:user.display_name})})
+app.post('/api/logout',(req,res)=>{res.clearCookie('token');res.json({ok:true})})
+app.get('/api/me',auth,(req,res)=>{const user=db.prepare('SELECT id,username,display_name,role,parent_id,is_active,created_at FROM users WHERE id=?').get(req.auth.id);res.json(user)})
+
+app.get('/api/channels',auth,(req,res)=>{const rows=db.prepare('SELECT id,name,is_active,created_at FROM channels WHERE is_active=1 ORDER BY created_at DESC').all();res.json(rows)})
+app.post('/api/channels',auth,requireRole(['super_admin','admin']),(req,res)=>{const {name}=req.body||{};if(!name)return res.status(400).json({error:'invalid'});const exists=db.prepare('SELECT 1 FROM channels WHERE name=?').get(name);if(exists)return res.status(409).json({error:'exists'});const id=uuidv4();db.prepare('INSERT INTO channels(id,name,created_by,is_active,created_at) VALUES(?,?,?,?,?)').run(id,name,req.auth.id,1,Date.now());res.json({id,name})})
+app.patch('/api/channels/:id',auth,requireRole(['super_admin','admin']),(req,res)=>{const id=req.params.id;let {name,is_active}=req.body||{};const ch=db.prepare('SELECT * FROM channels WHERE id=?').get(id);if(!ch)return res.status(404).json({error:'notfound'});if(typeof name==='string'&&name.trim()){const exists=db.prepare('SELECT 1 FROM channels WHERE name=? AND id<>?').get(name,id);if(exists)return res.status(409).json({error:'exists'})}
+if(is_active!==undefined){is_active=is_active?1:0}
+db.prepare('UPDATE channels SET name=COALESCE(?,name), is_active=COALESCE(?,is_active) WHERE id=?').run(name,is_active,id);const row=db.prepare('SELECT id,name,is_active,created_at FROM channels WHERE id=?').get(id);res.json(row)})
+const cascadeDeleteChannel=db.transaction((channelId)=>{const custIds=db.prepare('SELECT id FROM customers WHERE channel_id=?').all(channelId).map(r=>r.id);if(custIds.length>0){const inList='('+custIds.map(()=>'?').join(',')+')';db.prepare('DELETE FROM duplicates WHERE customer_id IN '+inList).run(...custIds);db.prepare('DELETE FROM customers WHERE id IN '+inList).run(...custIds)}db.prepare('DELETE FROM duplicates WHERE duplicate_channel_id=?').run(channelId);db.prepare('DELETE FROM channels WHERE id=?').run(channelId)});
+app.delete('/api/channels/:id',auth,requireRole(['super_admin','admin']),(req,res)=>{const id=req.params.id;const ch=db.prepare('SELECT * FROM channels WHERE id=?').get(id);if(!ch)return res.status(404).json({error:'notfound'});cascadeDeleteChannel(id);res.json({ok:true})})
+
+app.get('/api/users/admins',auth,requireRole(['super_admin']),(req,res)=>{const rows=db.prepare('SELECT id,username,display_name,role,is_active,created_at FROM users WHERE role=? ORDER BY created_at DESC').all('admin');res.json(rows)})
+app.get('/api/users/operators',auth,(req,res)=>{if(req.auth.role==='admin'){const rows=db.prepare('SELECT id,username,display_name,role,parent_id,is_active,created_at FROM users WHERE role=? AND parent_id=? ORDER BY created_at DESC').all('operator',req.auth.id);return res.json(rows)}if(req.auth.role==='super_admin'){const adminId=req.query.adminId||null;if(adminId){const rows=db.prepare('SELECT id,username,display_name,role,parent_id,is_active,created_at FROM users WHERE role=? AND parent_id=? ORDER BY created_at DESC').all('operator',adminId);return res.json(rows)}const rows=db.prepare('SELECT id,username,display_name,role,parent_id,is_active,created_at FROM users WHERE role=? ORDER BY created_at DESC').all('operator');return res.json(rows)}return res.status(403).json({error:'forbidden'})})
+app.post('/api/users/admin',auth,requireRole(['super_admin']),async(req,res)=>{const {username,display_name,password}=req.body||{};if(!username||!display_name||!password)return res.status(400).json({error:'invalid'});const exists=db.prepare('SELECT 1 FROM users WHERE username=?').get(username);if(exists)return res.status(409).json({error:'exists'});const id=uuidv4();const hash=await argon2.hash(password);db.prepare('INSERT INTO users(id,username,display_name,role,parent_id,is_active,password_hash,created_at) VALUES(?,?,?,?,?,?,?,?)').run(id,username,display_name,'admin',req.auth.id,1,hash,Date.now());res.json({id,username,display_name})})
+app.post('/api/users/operator',auth,requireRole(['super_admin','admin']),async(req,res)=>{let {username,display_name,password,owner_admin_id}=req.body||{};if(req.auth.role==='admin')owner_admin_id=req.auth.id;if(!username||!display_name||!password||!owner_admin_id)return res.status(400).json({error:'invalid'});const exists=db.prepare('SELECT 1 FROM users WHERE username=?').get(username);if(exists)return res.status(409).json({error:'exists'});const id=uuidv4();const hash=await argon2.hash(password);db.prepare('INSERT INTO users(id,username,display_name,role,parent_id,is_active,password_hash,created_at) VALUES(?,?,?,?,?,?,?,?)').run(id,username,display_name,'operator',owner_admin_id,1,hash,Date.now());res.json({id,username,display_name,parent_id:owner_admin_id})})
+app.patch('/api/users/:id/password',auth,requireRole(['super_admin','admin']),async(req,res)=>{const targetId=req.params.id;const {new_password}=req.body||{};if(!new_password||new_password.length<6)return res.status(400).json({error:'weak'});const target=db.prepare('SELECT * FROM users WHERE id=? AND is_active=1').get(targetId);if(!target)return res.status(404).json({error:'notfound'});if(req.auth.role==='admin'){if(!(target.role==='operator'&&target.parent_id===req.auth.id))return res.status(403).json({error:'forbidden'})}const hash=await argon2.hash(new_password);db.prepare('UPDATE users SET password_hash=? WHERE id=?').run(hash,targetId);res.json({ok:true})})
+app.patch('/api/users/:id/status',auth,requireRole(['super_admin','admin']),(req,res)=>{const targetId=req.params.id;let {is_active}=req.body||{};if(is_active===undefined)return res.status(400).json({error:'invalid'});const target=db.prepare('SELECT * FROM users WHERE id=?').get(targetId);if(!target)return res.status(404).json({error:'notfound'});if(req.auth.role==='admin'){if(!(target.role==='operator'&&target.parent_id===req.auth.id))return res.status(403).json({error:'forbidden'})}if(target.role==='super_admin'&&req.auth.role!=='super_admin')return res.status(403).json({error:'forbidden'});db.prepare('UPDATE users SET is_active=? WHERE id=?').run(is_active?1:0,targetId);res.json({ok:true})})
+const cascadeDeleteOperator=db.transaction((opId)=>{const custIds=db.prepare('SELECT id FROM customers WHERE owner_operator_id=?').all(opId).map(r=>r.id);if(custIds.length>0){const inList='('+custIds.map(()=>'?').join(',')+')';db.prepare('DELETE FROM duplicates WHERE customer_id IN '+inList).run(...custIds);db.prepare('DELETE FROM customers WHERE id IN '+inList).run(...custIds)}db.prepare('DELETE FROM users WHERE id=?').run(opId)});
+const cascadeDeleteAdmin=db.transaction((adminId)=>{const ops=db.prepare('SELECT id FROM users WHERE role=? AND parent_id=?').all('operator',adminId).map(r=>r.id);ops.forEach(id=>cascadeDeleteOperator(id));db.prepare('DELETE FROM users WHERE id=?').run(adminId)});
+app.delete('/api/users/:id',auth,requireRole(['super_admin','admin']),(req,res)=>{const targetId=req.params.id;const target=db.prepare('SELECT * FROM users WHERE id=?').get(targetId);if(!target)return res.status(404).json({error:'notfound'});if(target.role==='super_admin')return res.status(403).json({error:'forbidden'});if(req.auth.role==='admin'){if(!(target.role==='operator'&&target.parent_id===req.auth.id))return res.status(403).json({error:'forbidden'})}
+if(target.role==='operator'){cascadeDeleteOperator(targetId);return res.json({ok:true})}
+if(target.role==='admin'){if(req.auth.role!=='super_admin')return res.status(403).json({error:'forbidden'});cascadeDeleteAdmin(targetId);return res.json({ok:true})}
+return res.status(400).json({error:'invalid'})})
+
+app.delete('/api/customers/:id',auth,(req,res)=>{const id=req.params.id;const cust=db.prepare('SELECT * FROM customers WHERE id=?').get(id);if(!cust)return res.status(404).json({error:'notfound'});if(req.auth.role==='super_admin'){}else if(req.auth.role==='admin'){if(cust.owner_admin_id!==req.auth.id)return res.status(403).json({error:'forbidden'})}else{if(cust.owner_operator_id!==req.auth.id)return res.status(403).json({error:'forbidden'})}db.transaction(()=>{db.prepare('DELETE FROM duplicates WHERE customer_id=?').run(id);db.prepare('DELETE FROM customers WHERE id=?').run(id)})();res.json({ok:true})})
+
+app.post('/api/customers',auth,async(req,res)=>{const {phone_raw,channel_id,operator_id}=req.body||{};if(!phone_raw||!channel_id||!operator_id)return res.status(400).json({error:'invalid'});const op=db.prepare('SELECT * FROM users WHERE id=? AND role=? AND is_active=1').get(operator_id,'operator');if(!op||!op.parent_id)return res.status(403).json({error:'auth'});if(req.auth.role==='operator'&&req.auth.id!==op.id)return res.status(403).json({error:'forbidden'});if(req.auth.role==='admin'&&op.parent_id!==req.auth.id)return res.status(403).json({error:'forbidden'});const normalized=normalizePhone(phone_raw);const phone_hash=hmac(normalized);const phone_encrypted=encryptText(normalized);const admin_id=op.parent_id;const existing=db.prepare('SELECT * FROM customers WHERE phone_hash=? AND owner_admin_id=?').get(phone_hash,admin_id);if(existing){const dupId=uuidv4();db.prepare('INSERT INTO duplicates(id,customer_id,first_owner_id,duplicate_operator_id,duplicate_channel_id,duplicate_at) VALUES(?,?,?,?,?,?)').run(dupId,existing.id,existing.owner_operator_id,op.id,channel_id,Date.now());const owner=db.prepare('SELECT id,username,display_name FROM users WHERE id=?').get(existing.owner_operator_id);return res.json({status:'duplicate',existing_owner:owner,existing_created_at:existing.created_at})}const id=uuidv4();db.prepare('INSERT INTO customers(id,phone_hash,phone_encrypted,channel_id,owner_operator_id,owner_admin_id,created_at) VALUES(?,?,?,?,?,?,?)').run(id,phone_hash,phone_encrypted,channel_id,op.id,admin_id,Date.now());res.json({status:'success'})})
+app.get('/api/customers',auth,(req,res)=>{let base='SELECT c.id,c.channel_id,c.owner_operator_id,c.owner_admin_id,c.created_at,u.username AS op_username,a.username AS admin_username,ch.name AS channel_name FROM customers c JOIN users u ON c.owner_operator_id=u.id LEFT JOIN users a ON c.owner_admin_id=a.id LEFT JOIN channels ch ON c.channel_id=ch.id';let where=[];let params=[];if(req.auth.role==='super_admin'){}else if(req.auth.role==='admin'){where.push('c.owner_admin_id=?');params.push(req.auth.id)}else{where.push('c.owner_operator_id=?');params.push(req.auth.id)}const q=(req.query.q||'').toLowerCase();if(q){where.push('(LOWER(ch.name) LIKE ? OR LOWER(u.username) LIKE ? OR LOWER(a.username) LIKE ?)');params.push('%'+q+'%','%'+q+'%','%'+q+'%')}if(where.length>0)base+=' WHERE '+where.join(' AND ');base+=' ORDER BY c.created_at DESC';const page=parseInt(req.query.page||'1',10);const size=parseInt(req.query.size||'20',10);const offset=(page-1)*size;base+=` LIMIT ${size} OFFSET ${offset}`;const rows=db.prepare(base).all(...params);res.json(rows)})
+
+async function init(){const cnt=db.prepare('SELECT COUNT(*) AS c FROM users').get().c;if(cnt===0){const superId=uuidv4();const adminId=uuidv4();const opId=uuidv4();const superHash=await argon2.hash('123456');const adminHash=await argon2.hash('123456');const opHash=await argon2.hash('123456');db.prepare('INSERT INTO users(id,username,display_name,role,parent_id,is_active,password_hash,created_at) VALUES(?,?,?,?,?,?,?,?)').run(superId,'super','超级管理员','super_admin',null,1,superHash,Date.now());db.prepare('INSERT INTO users(id,username,display_name,role,parent_id,is_active,password_hash,created_at) VALUES(?,?,?,?,?,?,?,?)').run(adminId,'adminA','管理员A','admin',superId,1,adminHash,Date.now());db.prepare('INSERT INTO users(id,username,display_name,role,parent_id,is_active,password_hash,created_at) VALUES(?,?,?,?,?,?,?,?)').run(opId,'opA','运营A','operator',adminId,1,opHash,Date.now());const ch1=uuidv4();db.prepare('INSERT INTO channels(id,name,created_by,is_active,created_at) VALUES(?,?,?,?,?)').run(ch1,'默认渠道',superId,1,Date.now())}}
+init().then(()=>{app.listen(PORT,()=>{process.stdout.write('ok\n')})})
