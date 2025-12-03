@@ -556,16 +556,32 @@ def batch_create_customers():
         success = 0
         duplicate = 0
         failed = 0
+        channel_cache = {}
+        duplicate_sources = set()
+        failed_reasons = []
         for p in phones:
+            try:
+                if p is None or str(p).strip()=='':
+                    failed += 1
+                    failed_reasons.append('空行')
+                    continue
+            except Exception:
+                failed += 1
+                failed_reasons.append('空行')
+                continue
             try:
                 normalized = normalize_phone(p)
             except Exception:
                 failed += 1
+                try:
+                    failed_reasons.append(f"{str(p)[:32]} (格式错误)")
+                except Exception:
+                    failed_reasons.append('格式错误')
                 continue
             phone_hash = sha256_hex(normalized)
             phone_encrypted = normalized.encode('utf-8').hex()
             s6 = sig6(normalized)
-            cur.execute(fmt("SELECT id, owner_operator_id, created_at FROM customers WHERE phone_hash=%s AND owner_admin_id=%s LIMIT 1"), (phone_hash, admin_id))
+            cur.execute(fmt("SELECT id, owner_operator_id, channel_id, created_at FROM customers WHERE phone_hash=%s AND owner_admin_id=%s LIMIT 1"), (phone_hash, admin_id))
             ex = cur.fetchone()
             if ex:
                 dup_id = rid()
@@ -573,6 +589,19 @@ def batch_create_customers():
                 cur.execute(fmt("INSERT INTO duplicates (id,customer_id,first_owner_id,duplicate_operator_id,duplicate_channel_id,duplicate_at) VALUES (%s,%s,%s,%s,%s,NOW())"),
                             (dup_id, exd['id'], exd['owner_operator_id'], operator_id, channel_id))
                 duplicate += 1
+                try:
+                    ex_ch = exd.get('channel_id')
+                    if ex_ch:
+                        nm = channel_cache.get(ex_ch)
+                        if nm is None:
+                            cur.execute(fmt("SELECT name FROM channels WHERE id=%s"), (ex_ch,))
+                            rr = cur.fetchone()
+                            nm = (dict(rr)['name'] if rr else '') if USE_SQLITE else (rr['name'] if rr else '')
+                            channel_cache[ex_ch] = nm or ''
+                        if nm:
+                            duplicate_sources.add(nm)
+                except Exception:
+                    pass
                 continue
             try:
                 cust_id = rid()
@@ -584,14 +613,33 @@ def batch_create_customers():
                 existing = cur.fetchone()
                 if existing:
                     dup_id = rid()
-                    ex = dict(existing)
+                    ex = dict(existing) if USE_SQLITE else existing
                     cur.execute(fmt("INSERT INTO duplicates (id,customer_id,first_owner_id,duplicate_operator_id,duplicate_channel_id,duplicate_at) VALUES (%s,%s,%s,%s,%s,NOW())"),
                                 (dup_id, ex['id'], ex['owner_operator_id'], operator_id, channel_id))
                     duplicate += 1
+                    try:
+                        ex_ch = ex.get('channel_id') if isinstance(ex, dict) else (ex['channel_id'])
+                        if ex_ch:
+                            nm = channel_cache.get(ex_ch)
+                            if nm is None:
+                                cur.execute(fmt("SELECT name FROM channels WHERE id=%s"), (ex_ch,))
+                                rr = cur.fetchone()
+                                nm = (dict(rr)['name'] if rr else '') if USE_SQLITE else (rr['name'] if rr else '')
+                                channel_cache[ex_ch] = nm or ''
+                            if nm:
+                                duplicate_sources.add(nm)
+                    except Exception:
+                        pass
                 else:
                     failed += 1
+                    try:
+                        failed_reasons.append(f"{str(p)[:32]} (插入失败)")
+                    except Exception:
+                        failed_reasons.append('插入失败')
         cn.commit()
-        return jsonify({'status':'ok','stats': {'success': success, 'duplicate': duplicate, 'failed': failed}})
+        dup_list = list(duplicate_sources)
+        failed_samples = failed_reasons[:5]
+        return jsonify({'status':'ok','stats': {'success': success, 'duplicate': duplicate, 'failed': failed, 'duplicate_channels': dup_list, 'failed_samples': failed_samples}})
     except Exception as e:
         try:
             cn.rollback()
