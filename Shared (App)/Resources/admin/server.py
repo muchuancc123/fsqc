@@ -6,6 +6,7 @@ from datetime import datetime
 from flask import Flask, request, jsonify, send_from_directory, send_file, abort, Response
 import traceback
 import sqlite3
+import time
 USE_SQLITE = True
 
 def db_params():
@@ -536,6 +537,70 @@ def create_customer():
             return jsonify({'status':'duplicate','existing_owner':ex['owner_operator_id'],'existing_created_at':ex['created_at'],'existing_channel_id':ex['channel_id'],'existing_channel_name': ch_name})
         cn.commit(); cur.close(); cn.close()
         return jsonify({'error':'conflict'}), 409
+
+@app.route('/api/customers/batch', methods=['POST'])
+def batch_create_customers():
+    data = request.get_json(force=True)
+    phones = data.get('phones') or []
+    channel_id = data.get('channel_id')
+    operator_id = data.get('operator_id')
+    if not isinstance(phones, list) or not channel_id or not operator_id:
+        return jsonify({'error':'invalid'}), 400
+    cn = conn(); cur = cn.cursor()
+    cur.execute(fmt("SELECT parent_id FROM users WHERE id=%s AND role='operator'"), (operator_id,))
+    r = cur.fetchone()
+    if not r:
+        cur.close(); cn.close()
+        return jsonify({'error':'auth'}), 403
+    admin_id = (dict(r)['parent_id'] if USE_SQLITE else r['parent_id'])
+    success = 0
+    duplicate = 0
+    failed = 0
+    try:
+        for p in phones:
+            try:
+                normalized = normalize_phone(p)
+            except Exception:
+                failed += 1
+                continue
+            phone_hash = sha256_hex(normalized)
+            phone_encrypted = normalized.encode('utf-8').hex()
+            s6 = sig6(normalized)
+            cur.execute(fmt("SELECT id, owner_operator_id, created_at FROM customers WHERE phone_hash=%s AND owner_admin_id=%s LIMIT 1"), (phone_hash, admin_id))
+            ex = cur.fetchone()
+            if ex:
+                dup_id = rid()
+                exd = dict(ex) if USE_SQLITE else ex
+                cur.execute(fmt("INSERT INTO duplicates (id,customer_id,first_owner_id,duplicate_operator_id,duplicate_channel_id,duplicate_at) VALUES (%s,%s,%s,%s,%s,NOW())"),
+                            (dup_id, exd['id'], exd['owner_operator_id'], operator_id, channel_id))
+                duplicate += 1
+                continue
+            try:
+                cust_id = rid()
+                cur.execute(fmt("INSERT INTO customers (id,phone_raw,phone_normalized,phone_hash,phone_encrypted,sig6,channel_id,owner_operator_id,owner_admin_id,created_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())"),
+                            (cust_id, p, normalized, phone_hash, phone_encrypted, s6, channel_id, operator_id, admin_id))
+                success += 1
+            except Exception:
+                cur.execute(fmt("SELECT * FROM customers WHERE (phone_hash=%s OR sig6=%s) ORDER BY created_at ASC LIMIT 1"), (phone_hash, s6))
+                existing = cur.fetchone()
+                if existing:
+                    dup_id = rid()
+                    ex = dict(existing)
+                    cur.execute(fmt("INSERT INTO duplicates (id,customer_id,first_owner_id,duplicate_operator_id,duplicate_channel_id,duplicate_at) VALUES (%s,%s,%s,%s,%s,NOW())"),
+                                (dup_id, ex['id'], ex['owner_operator_id'], operator_id, channel_id))
+                    duplicate += 1
+                else:
+                    failed += 1
+        cn.commit()
+    except Exception:
+        try:
+            cn.rollback()
+        except Exception:
+            pass
+        cur.close(); cn.close()
+        return jsonify({'error':'error'}), 500
+    cur.close(); cn.close()
+    return jsonify({'status':'ok','stats': {'success': success, 'duplicate': duplicate, 'failed': failed}})
 
 @app.route('/api/migrate/normalize_phones', methods=['POST'])
 def migrate_normalize_phones():
