@@ -540,23 +540,22 @@ def create_customer():
 
 @app.route('/api/customers/batch', methods=['POST'])
 def batch_create_customers():
-    data = request.get_json(force=True)
-    phones = data.get('phones') or []
-    channel_id = data.get('channel_id')
-    operator_id = data.get('operator_id')
-    if not isinstance(phones, list) or not channel_id or not operator_id:
-        return jsonify({'error':'invalid'}), 400
-    cn = conn(); cur = cn.cursor()
-    cur.execute(fmt("SELECT parent_id FROM users WHERE id=%s AND role='operator'"), (operator_id,))
-    r = cur.fetchone()
-    if not r:
-        cur.close(); cn.close()
-        return jsonify({'error':'auth'}), 403
-    admin_id = (dict(r)['parent_id'] if USE_SQLITE else r['parent_id'])
-    success = 0
-    duplicate = 0
-    failed = 0
     try:
+        data = request.get_json(force=True)
+        phones = data.get('phones') or []
+        channel_id = data.get('channel_id')
+        operator_id = data.get('operator_id')
+        if not isinstance(phones, list) or not channel_id or not operator_id:
+            return jsonify({'error':'invalid'}), 400
+        cn = conn(); cur = cn.cursor()
+        cur.execute(fmt("SELECT parent_id FROM users WHERE id=%s AND role='operator'"), (operator_id,))
+        r = cur.fetchone()
+        if not r:
+            return jsonify({'error':'auth'}), 403
+        admin_id = (dict(r)['parent_id'] if USE_SQLITE else r['parent_id'])
+        success = 0
+        duplicate = 0
+        failed = 0
         for p in phones:
             try:
                 normalized = normalize_phone(p)
@@ -592,15 +591,19 @@ def batch_create_customers():
                 else:
                     failed += 1
         cn.commit()
-    except Exception:
+        return jsonify({'status':'ok','stats': {'success': success, 'duplicate': duplicate, 'failed': failed}})
+    except Exception as e:
         try:
             cn.rollback()
         except Exception:
             pass
-        cur.close(); cn.close()
-        return jsonify({'error':'error'}), 500
-    cur.close(); cn.close()
-    return jsonify({'status':'ok','stats': {'success': success, 'duplicate': duplicate, 'failed': failed}})
+        print(traceback.format_exc())
+        return jsonify({'error':'server_error','detail': str(e)}), 500
+    finally:
+        try:
+            cur.close(); cn.close()
+        except Exception:
+            pass
 
 @app.route('/api/migrate/normalize_phones', methods=['POST'])
 def migrate_normalize_phones():
