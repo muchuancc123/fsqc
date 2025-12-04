@@ -1,5 +1,6 @@
 Shared (App)/Resources/admin/.venv/
 Shared (App)/Resources/admin/__pycache__/
 Shared (App)/Resources/admin/quchong_admin.db
+Shared (App)/Resources/admin/server.log
 *.pyc
 .DS_Store
